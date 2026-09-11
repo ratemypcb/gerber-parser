@@ -54,3 +54,32 @@ M02*
 
     assert_eq!(gbr_string, gerber_doc_to_str(doc))
 }
+
+#[test]
+fn escaped_comment_delimiters_preserve_following_macro_and_flash() {
+    // Reduced from MakerPnP/gerber-viewer demo.gbr. Gerber 3.4.3 requires
+    // literal '*' and '%' in comment strings to use Unicode escapes.
+    let source = r"%FSLAX46Y46*%
+%MOMM*%
+G04 \u0025MIB1\u002A\u0025 *
+G04 \u0025IR180\u002A\u0025 *
+G04 --- ASCII 42 (\u002A) ---*
+G04 Character spacing is 10 units \u002A scale = 10 \u002A 0.1 = 1.0 mm*
+%AMCircle*
+0 Circle primitive*
+1,1,1,0,0*
+%
+%ADD34Circle*%
+D34*
+X5000000Y5000000D03*
+M02*
+";
+    for input in [source.to_string(), source.replace('\n', "")] {
+        let doc = parse(gerber_to_reader(&input)).unwrap();
+        assert!(doc.errors().is_empty(), "{:?}", doc.errors());
+        assert_eq!(doc.commands.len(), 11);
+        assert_eq!(doc.apertures.len(), 1);
+        assert!(doc.apertures.contains_key(&34));
+        assert_eq!(gerber_doc_to_str(doc), source.replace("*\n%\n", "*%\n"));
+    }
+}
