@@ -21,7 +21,7 @@ use gerber_types::{
 };
 use lazy_regex::*;
 use regex::Regex;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::{BufReader, Bytes, Read};
 use std::iter::FromIterator;
 use std::str::Chars;
@@ -83,6 +83,8 @@ struct ParserContext<T: Read> {
     // Used only for error context; Gerber itself treats newlines as insignificant.
     line_number: usize,
     bytes: Bytes<BufReader<T>>,
+    // Bytes read ahead (e.g. the rest of a comment line) and handed back to the tokenizer.
+    pending: VecDeque<u8>,
     // Running count of newlines consumed so far.
     current_line: usize,
     aperture_attributes: HashMap<String, ApertureAttribute>,
@@ -95,6 +97,7 @@ impl<T: Read> ParserContext<T> {
         ParserContext {
             line_number: 0,
             bytes: reader.bytes(),
+            pending: VecDeque::new(),
             current_line: 1,
             aperture_attributes: HashMap::new(),
             object_attributes: HashMap::new(),
@@ -117,15 +120,10 @@ impl<T: Read> ParserContext<T> {
         let mut skip_ws = true;
 
         loop {
-            let byte = match self.bytes.next() {
+            let byte = match self.next_byte() {
                 None => break, // EOF
                 Some(Ok(byte)) => byte,
-                Some(Err(e)) => {
-                    return Some(Err(ContentError::IoError(format!(
-                        "IO error on line: {}, error: {}",
-                        self.current_line, e
-                    ))));
-                }
+                Some(Err(e)) => return Some(Err(e)),
             };
 
             if byte == b'\r' {
@@ -171,6 +169,18 @@ impl<T: Read> ParserContext<T> {
                 }
                 _ => buf.push(byte),
             }
+
+            // A G04 comment's text may itself contain `*` and `%` (common in real files,
+            // although the spec asks for them to be escaped), so frame it separately.
+            if !in_extended && buf == b"G04" {
+                match self.read_comment_rest() {
+                    Ok(rest) => {
+                        buf.extend_from_slice(&rest);
+                        break;
+                    }
+                    Err(e) => return Some(Err(e)),
+                }
+            }
         }
 
         // Leading whitespace was already skipped; only a block ended by EOF (rather than a
@@ -189,6 +199,97 @@ impl<T: Read> ParserContext<T> {
                 self.line_number, e
             ))
         }))
+    }
+
+    fn next_byte(&mut self) -> Option<Result<u8, ContentError>> {
+        if let Some(byte) = self.pending.pop_front() {
+            return Some(Ok(byte));
+        }
+        self.bytes.next().map(|result| {
+            result.map_err(|e| {
+                ContentError::IoError(format!(
+                    "IO error on line: {}, error: {}",
+                    self.current_line, e
+                ))
+            })
+        })
+    }
+
+    // Called right after `G04` was read. Returns the comment text up to and including the
+    // `*` that ends it; everything after that `*` is pushed back for the tokenizer.
+    //
+    // The spec says the comment ends at the first `*` (literal `*`/`%` must be escaped),
+    // but many files, including hand-written ones, use them unescaped, e.g.
+    // `G04 %IR180*% *` or `G04 --- ASCII 42 (*) ---*`. The released line-based parser
+    // accepted those, so a `*` only ends the comment when the rest of the physical line is
+    // empty or starts with something that looks like a command. This keeps compact streams
+    // (`G04 note*X0Y0D03*`) splitting correctly. If no `*` qualifies, the last `*` on the
+    // line ends the comment (the old behaviour). Without any `*` the line is left as-is so it
+    // still reports an error.
+    fn read_comment_rest(&mut self) -> Result<Vec<u8>, ContentError> {
+        // Enough non-blank bytes after a `*` to decide whether a command follows it.
+        const LOOKAHEAD: usize = 4;
+
+        let mut line: Vec<u8> = Vec::new();
+        let mut newline = false;
+        // Undecided `*` positions, oldest first.
+        let mut stars: VecDeque<usize> = VecDeque::new();
+        let mut last_star: Option<usize> = None;
+        let mut split: Option<usize> = None;
+
+        while let Some(byte) = self.next_byte() {
+            let byte = byte?;
+            if byte == b'\n' {
+                newline = true;
+                break;
+            }
+            line.push(byte);
+            if byte == b'*' {
+                stars.push_back(line.len() - 1);
+                last_star = Some(line.len() - 1);
+            }
+            // Decide each `*` once enough of what follows it has been read.
+            while let Some(&star) = stars.front() {
+                let after = line[star + 1..].trim_ascii_start();
+                if after.len() < LOOKAHEAD {
+                    break;
+                }
+                stars.pop_front();
+                if looks_like_command_start(after) {
+                    split = Some(star + 1);
+                    break;
+                }
+            }
+            if split.is_some() {
+                break;
+            }
+        }
+
+        // End of line/file: a pending `*` followed by a short command or nothing at all ends
+        // the comment; otherwise fall back to the last `*` on the line.
+        let split = split
+            .or_else(|| {
+                stars
+                    .iter()
+                    .copied()
+                    .find(|&star| {
+                        let after = line[star + 1..].trim_ascii();
+                        after.is_empty() || looks_like_command_start(after)
+                    })
+                    .map(|star| star + 1)
+            })
+            .or(last_star.map(|star| star + 1))
+            .unwrap_or(line.len());
+
+        let rest = line.split_off(split);
+        // Hand back unread bytes ahead of anything already pending.
+        if newline {
+            self.pending.push_front(b'\n');
+        }
+        for byte in rest.into_iter().rev() {
+            self.pending.push_front(byte);
+        }
+        Ok(line)
     }
 
     // Update the modal operation mode after a command was parsed (gerber spec 8.3).
@@ -217,6 +318,14 @@ impl<T: Read> ParserContext<T> {
 ///
 /// If a fatal error occurs (like an IO error), then a partial GerberDoc will be returned along
 /// with the error.
+// Does `text` (non-empty, trimmed) plausibly begin a Gerber command? Used to tell a `*`
+// that ends a G04 comment from a `*` that is part of the comment text.
+fn looks_like_command_start(text: &[u8]) -> bool {
+    static RE_COMMAND_START: Lazy<Regex> =
+        lazy_regex!(r"^(?:[GDM][0-9]|[XYIJ][+-]?[0-9.]|%[A-Z]{2}|\*)");
+    std::str::from_utf8(text).is_ok_and(|text| RE_COMMAND_START.is_match(text))
+}
+
 #[allow(clippy::result_large_err)]
 pub fn parse<T: Read>(reader: BufReader<T>) -> Result<GerberDoc, (GerberDoc, ParseError)> {
     let mut gerber_doc = GerberDoc::default();
